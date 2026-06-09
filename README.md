@@ -46,7 +46,7 @@ implemented and verified today versus what is planned.
 | Module | What it does | Status |
 |---|---|---|
 | `whitelist` | AVX-512 validator-key membership check | implemented, correctness-tested, benchmarked |
-| `afxdp` | AF_XDP zero-copy capture (UMEM, fill/completion rings) | implemented (capture core) |
+| `afxdp` | AF_XDP zero-copy capture (UMEM, fill/completion rings) | implemented (capture core); requires patched xsk-rs (see below) |
 | `flow` (DPDK) | Hardware flow rules, tail-drop, RX/TX steering | in tree, being refactored into a clean library API |
 | `leader_flow` | Per-leader flow-rule management | depends on `flow` refactor |
 
@@ -120,9 +120,11 @@ cargo build --features dpdk
 Hardware paths require: Linux, an AF_XDP-capable NIC (tested on Intel E810),
 hugepages, and appropriate privileges. See docs/ (M2) for setup.
 
-> Dependency versions in `Cargo.toml` (xsk-rs, ringbuf, etc.) are starting
-> points; pin them to versions verified on your toolchain before release. The
-> AF_XDP module also relies on `set_addr` from an xsk-rs fork (see code notes).
+> The AF_XDP module depends on a patched xsk-rs that adds a public `set_addr`
+> method (used to recycle frame descriptors in the hot path):
+> https://github.com/vitos1453/xsk-rs - wired via `[patch.crates-io]` in
+> `Cargo.toml`. Dependency versions in `Cargo.toml` are pinned to the toolchain
+> used here; verify them against yours before release.
 
 
 ---
