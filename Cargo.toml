@@ -1,36 +1,33 @@
 [package]
 name = "solana-net-core"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 description = "Low-latency network primitives for Solana: kernel-bypass packet capture (AF_XDP/DPDK), hardware tail-drop, and SIMD validator filtering."
-repository = "https://github.com/serg44-sys/solana-net-core"
+repository = "https://github.com/vitos1453/solana-net-core"
 keywords = ["solana", "dpdk", "af-xdp", "low-latency", "avx512"]
 categories = ["network-programming", "hardware-support"]
 readme = "README.md"
 
 [dependencies]
-# Optional hardware-specific dependencies, active only under respective features
-xsk-rs = { version = "0.3.0", optional = true }
-ringbuf = { version = "0.3.3", optional = true }
+xsk-rs = { version = "0.8", optional = true }
+ringbuf = { version = "0.4.4", optional = true }
 core_affinity = { version = "0.8", optional = true }
+tracing = { version = "0.1", optional = true }
+anyhow = { version = "1.0", optional = true }
 
-[dev-dependencies]
-# For reproducible benchmarks (grant milestone proofs).
-# criterion = "0.5"  # uncomment when adding benches/ with a criterion harness
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
-
-# Enabling 'afxdp' pulls in the required kernel-bypass dependencies
-afxdp = ["dep:xsk-rs", "dep:ringbuf", "dep:core_affinity"]
-
-# Gated for future DPDK refactoring (Milestone 1)
+afxdp = ["dep:xsk-rs", "dep:ringbuf", "dep:core_affinity", "dep:tracing", "dep:anyhow", "dep:libc"]
 dpdk = []
+
+[patch.crates-io]
+xsk-rs = { git = "https://github.com/vitos1453/xsk-rs", branch = "master" }
 
 [[bench]]
 name = "whitelist_bench"
 harness = false
-# benches/whitelist_bench.rs — criterion harness with confidence intervals.
-# Currently utilizing the built-in rdtsc test in src/whitelist.rs (see README).
