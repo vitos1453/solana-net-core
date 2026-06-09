@@ -85,6 +85,14 @@ cargo test --release whitelist_correctness -- --nocapture   # correctness vs sca
 cargo test --release whitelist_bench_rdtsc  -- --nocapture   # cycle counts
 ```
 
+> **Reproducibility note.** These numbers require AVX-512 to be enabled at
+> compile time. The repo ships a `.cargo/config.toml` with the necessary target
+> features (`+avx512f,+avx512bw,...` and `target-cpu=native`). Without them the
+> intrinsics are emulated and the scan is ~15x slower. The AVX-512 path
+> therefore requires a CPU that supports these features (AMD Zen 4+/Intel Ice
+> Lake+); on other hardware, use the scalar `is_trusted` path (a runtime
+> `is_x86_feature_detected!` fallback is on the roadmap).
+
 ---
 
 ## Roadmap (milestones)
