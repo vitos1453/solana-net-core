@@ -27,7 +27,3 @@ dpdk = []
 
 [patch.crates-io]
 xsk-rs = { git = "https://github.com/vitos1453/xsk-rs", branch = "master" }
-
-[[bench]]
-name = "whitelist_bench"
-harness = false
