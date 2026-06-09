@@ -1,28 +1,33 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::arch::x86_64::*;
 use std::ptr::addr_of;
-// === TIER 0.1% FIX: Выравнивание на 128 байт для исключения False Sharing ===
+
+/// 128-byte alignment to avoid false sharing of the atomic counter.
 #[repr(align(128))]
 pub struct ValidatorWhitelist {
     pub count: AtomicUsize,
 }
 pub static mut WHITELIST_KEYS: [[u8; 32]; 2048] = [[0u8; 32]; 2048];
 impl ValidatorWhitelist {
-    /// === TIER 0.1% FIX: Корректная AVX-512 проверка валидатора ===
-    /// Проверяет, есть ли pubkey (32 байта) в WHITELIST_KEYS, по 2 ключа за итерацию.
+    /// Correct AVX-512 validator membership check.
+    /// Tests whether `pubkey` (32 bytes) is present in WHITELIST_KEYS,
+    /// processing two keys per iteration.
     ///
-    /// БЫЛО (баг): _mm512_loadu_si512(pubkey) читал 64 байта от 32-байтного ключа
-    /// (out-of-bounds, UB), и mask==0xFFFF..FF требовал совпадения ДВУХ ключей
-    /// одновременно — функция почти всегда возвращала false даже для своих ключей.
+    /// Previous buggy version: `_mm512_loadu_si512(pubkey)` read 64 bytes from a
+    /// 32-byte key (out-of-bounds, UB), and `mask == 0xFFFF..FF` required TWO
+    /// keys to match simultaneously, so it almost always returned false even
+    /// for keys that were present.
     ///
-    /// СТАЛО: broadcast 32-байтного ключа в обе половины ZMM: target=[pubkey|pubkey].
-    /// Сравнение с парой [key_i | key_{i+1}]: младшие 32 бита маски = совпал key_i,
-    /// старшие 32 бита = совпал key_{i+1}. Корректно для обеих позиций.
+    /// Fix: broadcast the 32-byte key into both halves of a ZMM register:
+    /// `target = [pubkey | pubkey]`. Comparing against a pair `[key_i | key_{i+1}]`,
+    /// the low 32 bits of the mask mean key_i matched, the high 32 bits mean
+    /// key_{i+1} matched. Correct for both positions.
     ///
-    /// Безопасность: используем _mm512_loadu_si512 (unaligned) для keys_chunk —
-    /// массив [[u8;32];2048] выровнен на 32, не на 64; aligned-load дал бы риск.
-    /// Хвост за count заполнен нулями (статический буфер), нулевой ключ не совпадёт
-    /// с реальным искомым, поэтому нечётный count безопасен.
+    /// Safety: we use `_mm512_loadu_si512` (unaligned) for `keys_chunk` because
+    /// the `[[u8;32];2048]` array is 32-byte aligned, not 64; an aligned load
+    /// would risk a fault. The tail beyond `count` is zero-filled (static
+    /// buffer), and a zero key never matches a real lookup key, so an odd
+    /// `count` is safe.
     #[inline(always)]
     pub unsafe fn is_trusted_avx512(&self, pubkey: &[u8; 32]) -> bool {
         let count = self.count.load(Ordering::Relaxed);
@@ -30,8 +35,8 @@ impl ValidatorWhitelist {
 
         let base_ptr = addr_of!(WHITELIST_KEYS) as *const [u8; 32];
 
-        // Broadcast 32-байтного ключа в 64 байта: target = [pubkey | pubkey].
-        // Явные unsafe-блоки (Rust 2024: unsafe_op_in_unsafe_fn) — чисто для open-source.
+        // Broadcast the 32-byte key into 64 bytes: target = [pubkey | pubkey].
+        // Explicit unsafe blocks (Rust 2024: unsafe_op_in_unsafe_fn) for clean OSS.
         let target = unsafe {
             let target_lo = _mm256_loadu_si256(pubkey.as_ptr() as *const __m256i);
             _mm512_inserti64x4(_mm512_castsi256_si512(target_lo), target_lo, 1)
@@ -39,12 +44,12 @@ impl ValidatorWhitelist {
 
         let mut i = 0;
         while i < count {
-            // 2 ключа (64 байта) за раз; unaligned load — без требования к 64-align.
+            // Two keys (64 bytes) at a time; unaligned load (no 64-byte align req).
             let mask: u64 = unsafe {
                 let keys_chunk = _mm512_loadu_si512(base_ptr.add(i) as *const _);
                 _mm512_cmpeq_epi8_mask(keys_chunk, target)
             };
-            // Младшие 32 бита == key_i совпал; старшие 32 бита == key_{i+1} совпал.
+            // Low 32 bits == key_i matched; high 32 bits == key_{i+1} matched.
             if (mask & 0xFFFF_FFFF) == 0xFFFF_FFFF || (mask >> 32) == 0xFFFF_FFFF {
                 return true;
             }
@@ -99,7 +104,8 @@ mod whitelist_bench {
         keys
     }
 
-    /// ТЕСТ КОРРЕКТНОСТИ — сверяем AVX-512 со скалярной (binary_search).
+    /// Correctness test: compare the AVX-512 path against the scalar
+    /// (binary_search) reference on the same data.
     #[test]
     fn whitelist_correctness() {
         let keys = setup(512);
@@ -107,7 +113,7 @@ mod whitelist_bench {
         let mut avx_found = 0;
         let mut scalar_found = 0;
 
-        // 1. Присутствующие ключи — обе версии должны вернуть true.
+        // 1. Keys that ARE present: both versions must return true.
         for k in &keys {
             let avx = unsafe { WHITELIST.is_trusted_avx512(k) };
             let scalar = WHITELIST.is_trusted(k);
@@ -121,7 +127,7 @@ mod whitelist_bench {
             }
         }
 
-        // 2. Отсутствующие ключи — обе должны вернуть false.
+        // 2. Keys that are NOT present: both must return false.
         for seed in 100_000..100_512u64 {
             let k = make_key(seed);
             let avx = unsafe { WHITELIST.is_trusted_avx512(&k) };
@@ -135,25 +141,25 @@ mod whitelist_bench {
         }
 
         println!("[CORRECTNESS] keys in list: {}", keys.len());
-        println!("[CORRECTNESS] avx found {} / scalar found {} (из {} присутствующих)",
+        println!("[CORRECTNESS] avx found {} / scalar found {} (of {} present)",
                  avx_found, scalar_found, keys.len());
         println!("[CORRECTNESS] mismatches (avx vs scalar): {}", mismatches);
 
-        assert_eq!(scalar_found, keys.len(), "scalar binary_search не нашёл все ключи — баг setup");
+        assert_eq!(scalar_found, keys.len(), "scalar binary_search missed keys (setup bug)");
         assert_eq!(mismatches, 0,
-            "AVX-512 версия расходится со скалярной! БАГ в SIMD-логике.");
+            "AVX-512 path disagrees with scalar reference! SIMD logic bug.");
     }
 
-    /// Замер тактов через rdtsc, с black_box и warmup. ТРИ сценария + сравнение
-    /// с binary_search, чтобы видеть: AVX-скан это O(n), а bin_search O(log n).
+    /// Cycle measurement via rdtsc, with black_box and warmup. Three scenarios
+    /// plus a comparison with binary_search: AVX scan is O(n), bin_search O(log n).
     #[test]
     fn whitelist_bench_rdtsc() {
         let keys = setup(512);
-        let first   = keys[0];          // ранний выход после 1-й итерации
-        let middle  = keys[256];        // проход до середины (~128 итераций)
-        let absent  = make_key(999_999);// полный проход (256 итераций)
+        let first   = keys[0];          // early exit after first iteration
+        let middle  = keys[256];        // scan to the middle (~128 iterations)
+        let absent  = make_key(999_999);// full scan (256 iterations)
 
-        // Warmup AVX-512.
+        // AVX-512 warmup.
         for _ in 0..100_000 {
             let _ = std::hint::black_box(unsafe {
                 WHITELIST.is_trusted_avx512(std::hint::black_box(&middle))
@@ -192,21 +198,21 @@ mod whitelist_bench {
         let sc_middle  = bench_scalar!(&middle);
         let sc_absent  = bench_scalar!(&absent);
 
-        println!("=== WHITELIST BENCH: 512 ключей, {} итераций, TSC-такты/вызов ===", ITERS);
-        println!("                       AVX-512 (O(n) скан)   scalar (O(log n) bin_search)");
-        println!("первая позиция [0]:    {:>8.1}             {:>8.1}", avx_first,  sc_first);
-        println!("середина     [256]:    {:>8.1}             {:>8.1}", avx_middle, sc_middle);
-        println!("промах (absent):       {:>8.1}             {:>8.1}", avx_absent, sc_absent);
+        println!("=== WHITELIST BENCH: 512 keys, {} iters, TSC cycles/call ===", ITERS);
+        println!("                       AVX-512 (O(n) scan)   scalar (O(log n) bin_search)");
+        println!("first position [0]:    {:>8.1}             {:>8.1}", avx_first,  sc_first);
+        println!("middle       [256]:    {:>8.1}             {:>8.1}", avx_middle, sc_middle);
+        println!("miss (absent):         {:>8.1}             {:>8.1}", avx_absent, sc_absent);
         println!();
-        println!("AVX пропускная способность на ПОЛНОМ скане:");
-        println!("  {:.1} тактов / 256 пар = {:.2} такта на пару ключей ({:.2} такта/ключ)",
+        println!("AVX throughput on a FULL scan:");
+        println!("  {:.1} cycles / 256 pairs = {:.2} cycles per key-pair ({:.2} cycles/key)",
                  avx_absent, avx_absent/256.0, avx_absent/512.0);
         println!();
-        println!("rdtsc = опорные TSC-такты, не такты ядра. нс = такты / частота_ГГц.");
-        println!("Запусти `lscpu | grep MHz` и подели на частоту для наносекунд.");
+        println!("rdtsc = reference TSC cycles, not core cycles. ns = cycles / freq_GHz.");
+        println!("Run `lscpu | grep MHz` and divide by frequency for nanoseconds.");
         println!();
-        println!("ВЫВОД: AVX-сравнение быстрое (~{:.1} такта/пара), но скан линейный O(n).",
+        println!("NOTE: the AVX comparison is fast (~{:.1} cycles/pair), but the scan is O(n).",
                  avx_absent/256.0);
-        println!("Если whitelist большой/частые промахи — bin_search O(log n) обгонит на промахах.");
+        println!("For large sets / miss-heavy workloads, O(log n) bin_search wins on misses.");
     }
 }
