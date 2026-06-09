@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::arch::x86_64::*;
 use std::ptr::addr_of;
