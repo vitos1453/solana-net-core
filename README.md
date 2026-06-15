@@ -12,6 +12,8 @@ Licensed under **MIT OR Apache-2.0** (your choice), the Rust/Solana standard, en
 
 Achieving competitive latency in the Solana ecosystem typically requires exclusive enterprise hardware (dedicated NIC ports, custom switch configs). Solo developers and small teams renting standard commodity servers are locked out of high-performance networking because mainstream hosting providers enforce LACP bonds, which breaks traditional DPDK implementations.
 
+Solana breaks transactions into **shreds** — small data fragments distributed across the network before assembly into full blocks. Capturing these shreds directly from the Turbine tree or from a Jito ShredStream proxy gives developers access to transaction data at the lowest possible latency, often saving hundreds of milliseconds compared to standard RPC paths — a critical advantage in high-frequency and MEV-sensitive workloads.
+
 `solana-net-core` bridges this gap. It provides the low-level pieces to capture and pre-filter Solana traffic on standard dedicated hardware, bypassing the OS network stack entirely:
 
 - **Kernel-Bypass Capture**: Seamless utilization of DPDK (`vfio-pci`) on dedicated ports, or AF_XDP (Zero-Copy UMEM) for environments requiring kernel cooperation.
@@ -54,7 +56,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-solana-net-core = { git = "[https://github.com/vitos1453/solana-net-core](https://github.com/vitos1453/solana-net-core)" }
+solana-net-core = { git = "https://github.com/vitos1453/solana-net-core" }
 ```
 
 Then use the high-level ingestion API:
@@ -123,6 +125,7 @@ Throughput of the AVX-512 comparison itself: **~1.25 cycles per key-pair (~0.63 
 eBPF LACP bypass overhead: measured **~1.71 ns/packet** additional latency compared to pure DPDK — negligible for shred ingestion.
 
 Reproduce:
+
 ```bash
 cargo test --release whitelist_correctness -- --nocapture   # correctness vs scalar
 cargo test --release whitelist_bench_rdtsc  -- --nocapture   # cycle counts
@@ -138,7 +141,7 @@ cargo test --release whitelist_bench_rdtsc  -- --nocapture   # cycle counts
 
 **M2 - Documentation & Examples.** Usage guide, integration example (a minimal consumer that prints captured/validated packets), and build instructions for AF_XDP, eBPF LACP bypass, and DPDK paths.
 
-**M3 - DevOps, NUMA-Tuning & eBPF Telemetry.** Development of a zero-overhead eBPF monitoring suite for hardware drops, automatic Ansible deployment scripts (Hugepages, NUMA pinning, isolcpus), and comprehensive `docs.rs` integration guides with reproducible benchmark suites.
+**M3 - DevOps, NUMA-Tuning & eBPF Telemetry.** Development of a minimal-overhead eBPF monitoring suite for hardware drops, automatic Ansible deployment scripts (Hugepages, NUMA pinning, isolcpus), and comprehensive `docs.rs` integration guides with reproducible benchmark suites.
 
 ---
 
@@ -150,7 +153,6 @@ The kernel-bypass modules are behind feature flags so the crate builds on an ord
 cargo build                 # core + whitelist, no hardware deps
 cargo build --features afxdp
 cargo build --features dpdk
-cargo build --features ebpf # for XDP/LACP bypass
 ```
 
 Hardware paths require: Linux, an AF_XDP-capable NIC (tested on Intel E810), hugepages, appropriate privileges, and (for eBPF) a kernel with XDP support. Detailed setup is in `docs/` (M2).
