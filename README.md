@@ -83,18 +83,24 @@ More examples and detailed setup instructions are in the `examples/` directory (
 
 ## Status
 
-This crate is under active development. The table below is honest about what is implemented and verified today versus what is planned.
+This crate is under active development. The table below is honest about what is
+implemented and verified today versus what is planned.
 
 | Module | What it does | Status |
 |---|---|---|
-| `whitelist` | AVX-512 validator-key membership check | implemented, correctness-tested, benchmarked |
-| `afxdp` | AF_XDP zero-copy capture (UMEM, fill/completion rings) | implemented (capture core); requires patched xsk-rs |
-| `ebpf_lacp` | XDP redirect to bypass LACP bond | implemented, tested on Intel E810 with LACP |
-| `xdp_filter` | Driver-level DDoS drop (XDP) | implemented; uses ice driver hooks |
-| `flow` (DPDK) | Hardware flow rules, tail-drop, RX/TX steering | in tree, being refactored into a clean library API |
-| `leader_flow` | Per-leader flow-rule management | depends on `flow` refactor |
+| `whitelist` | AVX-512 validator-key membership check | ✅ **Implemented**, correctness-tested, benchmarked |
+| `afxdp` | AF_XDP zero-copy capture (UMEM, fill/completion rings) | ✅ **Implemented** (capture core); requires patched xsk-rs (see below) |
+| `flow` (DPDK) | Hardware flow rules, tail-drop, RX/TX steering | 🔲 **Planned (M1)** — battle-tested in production HFT system, to be extracted into clean library API with generic `PacketSink` trait |
+| `leader_flow` | Per-leader flow-rule management | 🔲 **Planned (M1)** — depends on `flow` refactor |
+| `ebpf_lacp` | XDP redirect to bypass LACP bond | 🔲 **Planned (M2)** — architecture designed, eBPF implementation pending |
+| `xdp_filter` | Driver-level DDoS drop (XDP) | 🔲 **Planned (M2)** — depends on eBPF toolchain integration |
 
-The DPDK module currently exposes its hot path tied to an application-specific consumer. The planned work (see Roadmap) is to invert that dependency behind a generic `PacketSink` trait so the transport layer is reusable by any consumer, not just the original application.
+The DPDK flow modules (`flow` + `leader_flow`) exist as battle-tested production
+code in a proprietary HFT system processing live Solana mainnet traffic. The
+grant funds the engineering work to **extract these patterns into reusable,
+documented library APIs** — inverting the application-specific dependency behind
+a generic `PacketSink` trait so the transport layer becomes usable by any
+consumer, not just the original application.
 
 ---
 
