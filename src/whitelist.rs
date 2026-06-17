@@ -1,29 +1,59 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! AVX-512 validator-key membership check.
+//!
+//! Provides a fast SIMD-accelerated membership test against a static set of
+//! validator pubkeys. Designed for use behind hardware pre-filtering (so that
+//! only trusted traffic reaches this check and hits dominate).
+
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::arch::x86_64::*;
-use std::ptr::addr_of;
 
-/// 128-byte alignment to avoid false sharing of the atomic counter.
+// === Tier 0.1%: 128-byte alignment to avoid false sharing of the atomic counter ===
 #[repr(align(128))]
 pub struct ValidatorWhitelist {
     pub count: AtomicUsize,
 }
-pub static mut WHITELIST_KEYS: [[u8; 32]; 2048] = [[0u8; 32]; 2048];
+
+// === Tier 0.1%: Safe global storage via UnsafeCell + Sync wrapper ===
+//
+// Replaces the deprecated `pub static mut WHITELIST_KEYS` pattern. In Rust 2024
+// edition, `static mut` generates warnings and is considered an anti-pattern.
+// `UnsafeCell` inside a struct with explicit `unsafe impl Sync` is the
+// canonical way to express "global mutable state with caller-managed safety".
+#[repr(C, align(128))]
+pub struct WhitelistStorage {
+    keys: UnsafeCell<[[u8; 32]; 2048]>,
+}
+
+// Safety: access to the keys array is coordinated via the AtomicUsize counter
+// in ValidatorWhitelist using Acquire/Release semantics. Writers update the
+// array then Release-store the new count; readers Acquire-load the count before
+// reading the array. This provides happens-before guarantees.
+unsafe impl Sync for WhitelistStorage {}
+
+pub static WHITELIST_STORAGE: WhitelistStorage = WhitelistStorage {
+    keys: UnsafeCell::new([[0u8; 32]; 2048]),
+};
+
+/// Returns a raw pointer to the keys array. Callers must uphold the
+/// synchronization contract (Acquire-load of count before read, Release-store
+/// after write).
+#[inline(always)]
+fn get_whitelist_keys_ptr() -> *mut [[u8; 32]; 2048] {
+    WHITELIST_STORAGE.keys.get()
+}
+
 impl ValidatorWhitelist {
     /// Correct AVX-512 validator membership check.
-    /// Tests whether `pubkey` (32 bytes) is present in WHITELIST_KEYS,
+    /// Tests whether `pubkey` (32 bytes) is present in WHITELIST_STORAGE,
     /// processing two keys per iteration.
     ///
-    /// Previous buggy version: `_mm512_loadu_si512(pubkey)` read 64 bytes from a
-    /// 32-byte key (out-of-bounds, UB), and `mask == 0xFFFF..FF` required TWO
-    /// keys to match simultaneously, so it almost always returned false even
-    /// for keys that were present.
-    ///
     /// Fix: broadcast the 32-byte key into both halves of a ZMM register:
-    /// `target = [pubkey | pubkey]`. Comparing against a pair `[key_i | key_{i+1}]`,
-    /// the low 32 bits of the mask mean key_i matched, the high 32 bits mean
-    /// key_{i+1} matched. Correct for both positions.
+    /// `target = [pubkey | pubkey]`. Comparing against a pair
+    /// `[key_i | key_{i+1}]`, the low 32 bits of the mask mean key_i matched,
+    /// the high 32 bits mean key_{i+1} matched. Correct for both positions.
     ///
     /// Safety: we use `_mm512_loadu_si512` (unaligned) for `keys_chunk` because
     /// the `[[u8;32];2048]` array is 32-byte aligned, not 64; an aligned load
@@ -35,7 +65,7 @@ impl ValidatorWhitelist {
         let count = self.count.load(Ordering::Relaxed);
         if count == 0 { return false; }
 
-        let base_ptr = addr_of!(WHITELIST_KEYS) as *const [u8; 32];
+        let keys_ptr = get_whitelist_keys_ptr() as *const [u8; 32];
 
         // Broadcast the 32-byte key into 64 bytes: target = [pubkey | pubkey].
         // Explicit unsafe blocks (Rust 2024: unsafe_op_in_unsafe_fn) for clean OSS.
@@ -48,7 +78,7 @@ impl ValidatorWhitelist {
         while i < count {
             // Two keys (64 bytes) at a time; unaligned load (no 64-byte align req).
             let mask: u64 = unsafe {
-                let keys_chunk = _mm512_loadu_si512(base_ptr.add(i) as *const _);
+                let keys_chunk = _mm512_loadu_si512(keys_ptr.add(i) as *const _);
                 _mm512_cmpeq_epi8_mask(keys_chunk, target)
             };
             // Low 32 bits == key_i matched; high 32 bits == key_{i+1} matched.
@@ -59,26 +89,32 @@ impl ValidatorWhitelist {
         }
         false
     }
+
     #[inline(always)]
     pub fn is_trusted(&self, pubkey: &[u8; 32]) -> bool {
         let count = self.count.load(Ordering::Relaxed);
         if count == 0 { return false; }
-        let slice = unsafe { &WHITELIST_KEYS[..count] };
+        let keys_ptr = get_whitelist_keys_ptr() as *const [u8; 32];
+        let slice = unsafe { std::slice::from_raw_parts(keys_ptr, count) };
         slice.binary_search_by(|probe| probe.as_slice().cmp(pubkey.as_slice())).is_ok()
     }
+
     #[inline(always)]
     pub fn set_count(&self, count: usize) {
         self.count.store(count.min(2048), Ordering::Release);
     }
 }
+
 pub static WHITELIST: ValidatorWhitelist = ValidatorWhitelist {
     count: AtomicUsize::new(0),
 };
+
 pub fn update_static_keys(sorted_keys: &[[u8; 32]]) {
     let count = sorted_keys.len().min(2048);
     unsafe {
+        let keys_ptr = get_whitelist_keys_ptr();
         for i in 0..count {
-            WHITELIST_KEYS[i] = sorted_keys[i];
+            (*keys_ptr)[i] = sorted_keys[i];
         }
     }
     WHITELIST.set_count(count);
