@@ -12,18 +12,13 @@
 //!   UMEM mmap, madvise/mlock) on the calling thread; `run_loop` then moves the
 //!   ready state into a worker pinned to an isolated core, so the worker enters
 //!   the packet loop with zero initialization cost and no startup race.
-//! - The receive loop returns frame descriptors through `g_prod`; the consumer
-//!   is expected to return processed descriptors via the `r_cons` ring so frames
-//!   can be recycled into the fill queue. The capture layer itself does not
-//!   interpret packet contents.
-//!
-//! TODO (library API): the NIC queue id is currently a module constant
-//! (`GOSSIP_QUEUE_ID`). For general reuse it should be a parameter of
-//! `AfXdpGossipFilter::new`. Left as-is here to avoid an API change mid-refactor;
-//! tracked in the roadmap.
+//! - The receive loop returns frame descriptors through `frame_prod`; the
+//!   consumer is expected to return processed descriptors via the `frame_cons`
+//!   ring so frames can be recycled into the fill queue. The capture layer
+//!   itself does not interpret packet contents.
 
 use std::arch::x86_64::*;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::thread;
 use core_affinity::CoreId;
 use ringbuf::{
@@ -39,10 +34,37 @@ use xsk_rs::{
 };
 use std::ptr::NonNull;
 
-const GOSSIP_QUEUE_ID: u32 = 14;
-const UMEM_FRAME_COUNT: u32 = 4096;
-const RX_BATCH_SIZE: usize = 64;
-const COMP_BATCH_SIZE: usize = 32;
+/// Configuration for an AF_XDP capture instance.
+///
+/// All parameters that were previously hardcoded constants are now configurable
+/// per-NIC, per-queue, per-workload.
+#[derive(Debug, Clone)]
+pub struct AfXdpConfig {
+    /// NIC interface name (e.g. "enp1s0f0", "eth0")
+    pub iface: String,
+    /// NIC hardware queue id to bind the AF_XDP socket to.
+    /// Use `ethtool -L <iface>` to list available queues.
+    pub queue_id: u32,
+    /// Number of UMEM frames (must fit in NIC+driver limits, typically 4096–65536)
+    pub frame_count: u32,
+    /// Max frames consumed per RX poll iteration
+    pub rx_batch_size: usize,
+    /// Max completion descriptors drained per iteration
+    pub comp_batch_size: usize,
+}
+
+impl Default for AfXdpConfig {
+    fn default() -> Self {
+        Self {
+            iface: "eth0".into(),
+            queue_id: 0,
+            frame_count: 4096,
+            rx_batch_size: 64,
+            comp_batch_size: 32,
+        }
+    }
+}
+
 const FRAME_MASK: usize = !4095;
 
 static UMEM_BASE_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
@@ -168,32 +190,32 @@ pub struct AfXdpState {
     tx_q: TxQueue,
     umem_base: DmaRegion,
     descs: Vec<FrameDesc>,
-    iface: String,
+    config: AfXdpConfig,
     core_id: CoreId,
 }
 
 unsafe impl Send for AfXdpState {}
 
 /// AF_XDP capture front-end. Owns the SPSC rings to/from the consumer.
-pub struct AfXdpGossipFilter {
-    iface: String,
+pub struct AfXdpCapture {
+    config: AfXdpConfig,
     stop_signal: &'static AtomicBool,
-    g_prod: Option<CachingProd<&'static HeapRb<FrameDesc>>>,
-    r_cons: Option<CachingCons<&'static HeapRb<FrameDesc>>>,
+    frame_prod: Option<CachingProd<&'static HeapRb<FrameDesc>>>,
+    frame_cons: Option<CachingCons<&'static HeapRb<FrameDesc>>>,
 }
 
-impl AfXdpGossipFilter {
+impl AfXdpCapture {
     pub fn new(
-        iface: String,
+        config: AfXdpConfig,
         stop_signal: &'static AtomicBool,
-        g_prod: CachingProd<&'static HeapRb<FrameDesc>>,
-        r_cons: CachingCons<&'static HeapRb<FrameDesc>>,
+        frame_prod: CachingProd<&'static HeapRb<FrameDesc>>,
+        frame_cons: CachingCons<&'static HeapRb<FrameDesc>>,
     ) -> Self {
         Self {
-            iface,
+            config,
             stop_signal,
-            g_prod: Some(g_prod),
-            r_cons: Some(r_cons),
+            frame_prod: Some(frame_prod),
+            frame_cons: Some(frame_cons),
         }
     }
 
@@ -207,8 +229,8 @@ impl AfXdpGossipFilter {
     /// keeps madvise/mlock off the isolated core.
     pub fn init_sync(&mut self, core_id: CoreId) -> anyhow::Result<(AfXdpState, DmaRegion)> {
         tracing::info!(
-            "AF_XDP sync init on iface {} queue {}",
-            self.iface, GOSSIP_QUEUE_ID
+            "AF_XDP sync init on iface {} — queue {}",
+            self.config.iface, self.config.queue_id
         );
 
         let umem_config = UmemConfig::builder()
@@ -218,23 +240,24 @@ impl AfXdpGossipFilter {
 
         let (mut umem, descs) = Umem::new(
             umem_config,
-            std::num::NonZeroU32::new(UMEM_FRAME_COUNT).unwrap(),
+            std::num::NonZeroU32::new(self.config.frame_count).unwrap(),
             false,
         ).expect("Umem allocation failed");
 
-        let iface: Interface = self.iface.parse().expect("Invalid interface name");
+        let iface: Interface = self.config.iface.parse().expect("Invalid interface name");
         let config = SocketConfig::builder()
             .bind_flags(BindFlags::XDP_ZEROCOPY)
             .build();
 
         let (tx_q, rx_q, queues): (TxQueue, RxQueue, Option<(FillQueue, CompQueue)>) = unsafe {
-            Socket::new(config, &mut umem, &iface, GOSSIP_QUEUE_ID)
+            Socket::new(config, &mut umem, &iface, self.config.queue_id)
                 .expect("XDP_ZEROCOPY socket binding failed")
         };
         let (fill_q, comp_q) = queues.expect("Queue creation failed");
 
-        // UMEM base accounting for XDP headroom (256 bytes reserved by XDP).
-        // umem_base = data.as_ptr() - first_frame.addr() - headroom.len()
+        // === Headroom Shift ===
+        // UMEM base is computed accounting for the 256-byte XDP headroom.
+        // Formula: umem_base = data.as_ptr() - first_frame.addr() - headroom.len()
         let first_frame = &descs[0];
         let (headroom, data) = unsafe { umem.frame(first_frame) };
         let umem_base_addr = data.as_ptr() as usize
@@ -278,7 +301,7 @@ impl AfXdpGossipFilter {
             tx_q,
             umem_base: dma_region,
             descs,
-            iface: self.iface.clone(),
+            config: self.config.clone(),
             core_id,
         };
 
@@ -290,39 +313,42 @@ impl AfXdpGossipFilter {
     /// itself to `core_id` (intended to be an isolated core).
     ///
     /// Hot loop, per iteration:
-    /// 1. Recycle descriptors returned by the consumer (`r_cons`) into pending.
+    /// 1. Recycle descriptors returned by the consumer (`frame_cons`) into pending.
     /// 2. Drain the completion queue into pending.
-    /// 3. Consume received frames; forward to the consumer via `g_prod`, or
+    /// 3. Consume received frames; forward to the consumer via `frame_prod`, or
     ///    recycle if the consumer ring is full (backpressure).
     /// 4. Refill the fill queue from pending.
     /// 5. `pause` when idle to be polite to the core's sibling thread.
     pub fn run_loop(&mut self, mut state: AfXdpState) {
         let stop = self.stop_signal;
         let core_id = state.core_id;
-        let iface_name = state.iface.clone();
-        let mut gossip_prod = self.g_prod.take().expect("g_prod already consumed");
-        let mut return_cons = self.r_cons.take().expect("r_cons already consumed");
+        let iface_name = state.config.iface.clone();
+        let queue_id = state.config.queue_id;
+        let rx_batch = state.config.rx_batch_size;
+        let comp_batch = state.config.comp_batch_size;
+        let mut frame_prod = self.frame_prod.take().expect("frame_prod already consumed");
+        let mut return_cons = self.frame_cons.take().expect("frame_cons already consumed");
 
         thread::spawn(move || {
             core_affinity::set_for_current(core_id);
             tracing::info!(
                 "AF_XDP worker started on core {}: iface {}, queue {}, UMEM base {:p}",
-                core_id.id, iface_name, GOSSIP_QUEUE_ID, state.umem_base.as_ptr()
+                core_id.id, iface_name, queue_id, state.umem_base.as_ptr()
             );
 
             // Preload pending_fill from the initial descriptors (no allocation).
-            let mut pending_fill = RingPocket::new(UMEM_FRAME_COUNT as usize);
+            let mut pending_fill = RingPocket::new(state.descs.len());
             for desc in state.descs {
                 pending_fill.push(desc);
             }
 
             tracing::info!(
                 "AF_XDP zero-copy active: iface={}, queue={}, RX fd={:?}, TX fd={:?}, pending={}",
-                iface_name, GOSSIP_QUEUE_ID, state.rx_q.fd(), state.tx_q.fd(), pending_fill.len
+                iface_name, queue_id, state.rx_q.fd(), state.tx_q.fd(), pending_fill.len
             );
 
-            let mut batch: [FrameDesc; RX_BATCH_SIZE] = [FrameDesc::default(); RX_BATCH_SIZE];
-            let mut comp_batch: [FrameDesc; COMP_BATCH_SIZE] = [FrameDesc::default(); COMP_BATCH_SIZE];
+            let mut batch: Vec<FrameDesc> = vec![FrameDesc::default(); rx_batch];
+            let mut comp_batch_vec: Vec<FrameDesc> = vec![FrameDesc::default(); comp_batch];
 
             loop {
                 if stop.load(Ordering::Relaxed) { break; }
@@ -334,9 +360,9 @@ impl AfXdpGossipFilter {
                     pending_fill.push(desc);
                 }
 
-                let n_comp = unsafe { state.comp_q.consume(&mut comp_batch) };
+                let n_comp = unsafe { state.comp_q.consume(&mut comp_batch_vec) };
                 for i in 0..n_comp {
-                    let mut desc = comp_batch[i];
+                    let mut desc = comp_batch_vec[i];
                     let clean_addr = desc.addr() & FRAME_MASK;
                     desc.set_addr(clean_addr);
                     pending_fill.push(desc);
@@ -345,7 +371,7 @@ impl AfXdpGossipFilter {
                 let n_rx = unsafe { state.rx_q.consume(&mut batch) };
                 if n_rx > 0 {
                     for i in 0..n_rx {
-                        if gossip_prod.try_push(batch[i]).is_err() {
+                        if frame_prod.try_push(batch[i]).is_err() {
                             // Consumer ring full: recycle the frame instead of dropping silently.
                             let mut desc = batch[i];
                             let clean_addr = desc.addr() & FRAME_MASK;
@@ -373,8 +399,22 @@ pub struct AlignedIpTable {
     pub data: [u32; 1024],
 }
 
-pub static mut TRUSTED_IPS: AlignedIpTable = AlignedIpTable { data: [0; 1024] };
-pub static TRUSTED_IPS_COUNT: AtomicUsize = AtomicUsize::new(0);
+// === Tier 0.1%: Safe global storage via UnsafeCell + Sync wrapper ===
+use std::cell::UnsafeCell;
+
+#[repr(C, align(128))]
+pub struct TrustedIpsStorage {
+    table: UnsafeCell<AlignedIpTable>,
+}
+
+unsafe impl Sync for TrustedIpsStorage {}
+
+pub static TRUSTED_IPS_STORAGE: TrustedIpsStorage = TrustedIpsStorage {
+    table: UnsafeCell::new(AlignedIpTable { data: [0; 1024] }),
+};
+
+pub static TRUSTED_IPS_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Returns true if `ip` is in the trusted set. AVX-512 linear scan, 16 IPs per
 /// step. Same O(n) caveat as the key whitelist: intended for small trusted sets
@@ -384,7 +424,7 @@ pub unsafe fn is_ip_trusted(ip: u32) -> bool {
     let count = TRUSTED_IPS_COUNT.load(Ordering::Relaxed);
     if count == 0 { return false; }
     let target = unsafe { _mm512_set1_epi32(ip as i32) };
-    let base_ptr = unsafe { std::ptr::addr_of!(TRUSTED_IPS.data) as *const u32 };
+    let base_ptr = unsafe { (*TRUSTED_IPS_STORAGE.table.get()).data.as_ptr() };
     let mut i = 0;
     unsafe {
         while i < count {
