@@ -399,7 +399,7 @@ pub struct AlignedIpTable {
     pub data: [u32; 1024],
 }
 
-// === Tier 0.1%: Safe global storage via UnsafeCell + Sync wrapper ===
+// === Safe global storage via UnsafeCell + Sync wrapper ===
 use std::cell::UnsafeCell;
 
 #[repr(C, align(128))]
