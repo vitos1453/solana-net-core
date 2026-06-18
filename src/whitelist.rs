@@ -10,13 +10,13 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::arch::x86_64::*;
 
-// === Tier 0.1%: 128-byte alignment to avoid false sharing of the atomic counter ===
+// === 128-byte alignment to avoid false sharing of the atomic counter ===
 #[repr(align(128))]
 pub struct ValidatorWhitelist {
     pub count: AtomicUsize,
 }
 
-// === Tier 0.1%: Safe global storage via UnsafeCell + Sync wrapper ===
+// === Safe global storage via UnsafeCell + Sync wrapper ===
 //
 // Replaces the deprecated `pub static mut WHITELIST_KEYS` pattern. In Rust 2024
 // edition, `static mut` generates warnings and is considered an anti-pattern.
